@@ -14,6 +14,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -149,6 +150,20 @@ def load_settings() -> Settings:
 
 settings = load_settings()
 
+cors_debug_all_origins = os.getenv("CORS_DEBUG_ALL_ORIGINS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+if cors_debug_all_origins:
+    # Temporary debug mode only. This disables credentials so wildcard origins are valid.
+    cors_allow_origins = ["*"]
+    cors_allow_credentials = False
+else:
+    cors_allow_origins = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://portfolio-khaki-zeta-3frz86na3s.vercel.app",
+    ]
+    cors_allow_credentials = True
+
 
 class InboxSubmission(BaseModel):
     name: str = Field(min_length=2, max_length=80)
@@ -175,6 +190,13 @@ class MessageAnalysis(BaseModel):
 
 
 app = FastAPI(title="AI Portfolio Inbox & Insights", version="2.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_allow_origins,
+    allow_credentials=cors_allow_credentials,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
@@ -1135,6 +1157,24 @@ async def get_thread(thread_id: int) -> JSONResponse:
 
 @app.post("/api/inbox")
 async def create_message(payload: InboxSubmission) -> JSONResponse:
+    logger.info(
+        "Inbox submission received | source=%s | name=%s | email_provided=%s | company_provided=%s | message_length=%s",
+        payload.source,
+        payload.name,
+        bool(payload.email),
+        bool(payload.company),
+        len(payload.message),
+    )
+    logger.info(
+        "Inbox payload summary | payload=%s",
+        {
+            "name": payload.name,
+            "email": payload.email,
+            "company": payload.company,
+            "source": payload.source,
+            "message_preview": payload.message[:160],
+        },
+    )
     analysis, engine = openai_analysis(payload)
     now = utc_now()
     with closing(get_connection()) as connection:
@@ -1190,6 +1230,9 @@ async def create_message(payload: InboxSubmission) -> JSONResponse:
         except sqlite3.Error as exc:
             logger.exception("Failed to save inbox message: %s", exc)
             raise HTTPException(status_code=500, detail="Unable to save inbox message right now.") from exc
+        except Exception as exc:
+            logger.exception("Unexpected inbox submission failure: %s", exc)
+            raise HTTPException(status_code=500, detail="Unexpected inbox processing error.") from exc
 
         row = connection.execute(
             """
@@ -1222,8 +1265,17 @@ async def create_message(payload: InboxSubmission) -> JSONResponse:
             (message_id,),
         ).fetchone()
     if row is None:
+        logger.error("Inbox submission saved but reload failed | message_id=%s", message_id)
         raise HTTPException(status_code=500, detail="Message saved but could not be reloaded.")
-    return JSONResponse({"ok": True, "analysis_engine": engine, "message": serialize_message(row), "thread": thread, "related_messages": related_messages}, status_code=201)
+    response_payload = {"ok": True, "analysis_engine": engine, "message": serialize_message(row), "thread": thread, "related_messages": related_messages}
+    logger.info(
+        "Inbox submission completed | message_id=%s | thread_id=%s | response_keys=%s | message_keys=%s",
+        response_payload["message"]["id"],
+        response_payload["thread"].get("id"),
+        list(response_payload.keys()),
+        list(response_payload["message"].keys()),
+    )
+    return JSONResponse(response_payload, status_code=201)
 
 
 @app.get("/api/dashboard/summary")
