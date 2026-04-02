@@ -4,6 +4,7 @@ import os
 import re
 import sqlite3
 import smtplib
+import ssl
 import unicodedata
 from contextlib import closing
 from dataclasses import dataclass
@@ -128,18 +129,36 @@ class Settings:
     google_application_credentials: str
 
 
+def parse_bool_env(value: str, default: bool = False) -> bool:
+    normalized = (value or "").strip().lower()
+    if not normalized:
+        return default
+    return normalized in {"1", "true", "yes", "on"}
+
+
+def parse_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r. Falling back to %s.", name, raw, default)
+        return default
+
+
 def load_settings() -> Settings:
     owner_email = os.getenv("OWNER_EMAIL", "c.sanmiguelortega@gmail.com").strip()
+    smtp_username = os.getenv("SMTP_USERNAME", "").strip()
+    email_from = os.getenv("EMAIL_FROM", "").strip() or smtp_username
     return Settings(
         database_path=BASE_DIR / os.getenv("DATABASE_PATH", "ai_portfolio_inbox.db"),
         openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
         openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip(),
         smtp_host=os.getenv("SMTP_HOST", "").strip(),
-        smtp_port=int(os.getenv("SMTP_PORT", "587")),
-        smtp_username=os.getenv("SMTP_USERNAME", "").strip(),
+        smtp_port=parse_int_env("SMTP_PORT", 587),
+        smtp_username=smtp_username,
         smtp_password=os.getenv("SMTP_PASSWORD", "").strip(),
-        smtp_use_tls=os.getenv("SMTP_USE_TLS", "true").strip().lower() in {"1", "true", "yes", "on"},
-        email_from=os.getenv("EMAIL_FROM", "").strip(),
+        smtp_use_tls=parse_bool_env(os.getenv("SMTP_USE_TLS", "true"), default=True),
+        email_from=email_from,
         owner_email=os.getenv("OWNER_EMAIL", owner_email).strip() or owner_email,
         app_base_url=os.getenv("APP_BASE_URL", "http://127.0.0.1:8000").strip(),
         ai_match_threshold=float(os.getenv("AI_MATCH_THRESHOLD", "0.33")),
@@ -149,6 +168,15 @@ def load_settings() -> Settings:
 
 
 settings = load_settings()
+
+# Gmail SMTP recommended configuration:
+# SMTP_HOST=smtp.gmail.com
+# SMTP_PORT=587
+# SMTP_USE_TLS=true
+# SMTP_USERNAME=mi_correo_gmail
+# SMTP_PASSWORD=app_password_de_google
+# EMAIL_FROM=mi_correo_gmail
+# OWNER_EMAIL=mi_correo_personal_destino
 
 cors_debug_all_origins = os.getenv("CORS_DEBUG_ALL_ORIGINS", "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -568,7 +596,7 @@ def get_thread_messages(connection: sqlite3.Connection, thread_id: int, limit: i
             "theme_label": row["theme_label"] or "",
             "theme_slug": row["theme_slug"] or "",
             "thread_summary": row["thread_summary"] or "",
-            "email_status": row["email_status"] or "pending",
+            "email_status": allowed_email_status(row["email_status"] or "skipped"),
             "created_at": row["created_at"],
         }
         for row in rows
@@ -678,10 +706,62 @@ def refresh_thread_rollup(connection: sqlite3.Connection, thread_id: int, analys
     return dict(row) if row else {}
 
 
-def send_email_notification(message_id: int, submission: InboxSubmission, analysis: MessageAnalysis, thread: dict[str, Any], related_messages: list[dict[str, Any]]) -> str:
+def allowed_email_status(status: str) -> str:
+    normalized = (status or "").strip().lower()
+    return normalized if normalized in {"sent", "failed", "skipped"} else "failed"
+
+
+def smtp_diagnostics() -> dict[str, Any]:
     smtp_ready = all([settings.smtp_host, settings.smtp_username, settings.smtp_password, settings.email_from, settings.owner_email])
-    if not smtp_ready:
-        logger.info("SMTP is not configured. Message %s stored, email skipped.", message_id)
+    recommendations: list[str] = []
+
+    if not settings.smtp_host:
+        recommendations.append("Falta SMTP_HOST. Para Gmail usa smtp.gmail.com.")
+    if not settings.smtp_port:
+        recommendations.append("Falta SMTP_PORT. Para Gmail con TLS usa 587; para SSL usa 465.")
+    if not settings.smtp_username:
+        recommendations.append("Falta SMTP_USERNAME. Debe ser tu direccion de Gmail completa.")
+    if not settings.smtp_password:
+        recommendations.append("Falta SMTP_PASSWORD. Usa una App Password de Google, no tu password normal.")
+    if not settings.email_from:
+        recommendations.append("Falta EMAIL_FROM. Para Gmail normalmente debe coincidir con SMTP_USERNAME.")
+    if not settings.owner_email:
+        recommendations.append("Falta OWNER_EMAIL. Debe ser el correo que recibira las notificaciones.")
+    if settings.smtp_host and settings.smtp_host.lower() == "smtp.gmail.com" and settings.smtp_port == 587 and not settings.smtp_use_tls:
+        recommendations.append("Con Gmail y puerto 587, SMTP_USE_TLS deberia ser true.")
+    if settings.smtp_host and settings.smtp_host.lower() == "smtp.gmail.com" and settings.smtp_port == 465 and settings.smtp_use_tls:
+        recommendations.append("Con Gmail y puerto 465, usa SMTP_USE_TLS=false para activar SMTP_SSL.")
+    if smtp_ready and not recommendations:
+        recommendations.append("Configuracion SMTP lista para probar el envio real.")
+
+    return {
+        "smtp_host": settings.smtp_host,
+        "smtp_port": settings.smtp_port,
+        "smtp_use_tls": settings.smtp_use_tls,
+        "smtp_username_configured": bool(settings.smtp_username),
+        "smtp_password_configured": bool(settings.smtp_password),
+        "email_from": settings.email_from,
+        "owner_email": settings.owner_email,
+        "smtp_ready": smtp_ready,
+        "recomendaciones": recommendations,
+    }
+
+
+def send_email_notification(message_id: int, submission: InboxSubmission, analysis: MessageAnalysis, thread: dict[str, Any], related_messages: list[dict[str, Any]]) -> str:
+    diagnostics = smtp_diagnostics()
+    logger.info(
+        "SMTP config check | message_id=%s | smtp_host=%s | smtp_port=%s | smtp_use_tls=%s | smtp_username_present=%s | smtp_password_present=%s | email_from=%s | owner_email=%s",
+        message_id,
+        diagnostics["smtp_host"] or "",
+        diagnostics["smtp_port"],
+        diagnostics["smtp_use_tls"],
+        diagnostics["smtp_username_configured"],
+        diagnostics["smtp_password_configured"],
+        diagnostics["email_from"] or "",
+        diagnostics["owner_email"] or "",
+    )
+    if not diagnostics["smtp_ready"]:
+        logger.warning("SMTP not ready. Message %s stored, email skipped. recomendaciones=%s", message_id, diagnostics["recomendaciones"])
         return "skipped"
 
     related_lines = []
@@ -690,28 +770,31 @@ def send_email_notification(message_id: int, submission: InboxSubmission, analys
             continue
         related_lines.append(f"- {related['created_at']} | {related['user_name']} | {related['priority']} | {related['summary']}")
 
+    dashboard_url = f"{settings.app_base_url.rstrip('/')}/dashboard"
+    key_points_text = ", ".join(analysis.key_points) if analysis.key_points else "None"
     body = f"""
-New AI Portfolio Inbox & Insights message
+New AI Portfolio Inbox message
 
-Sender
+Message metadata
+- ID: {message_id}
 - Name: {submission.name}
 - Email: {submission.email or "not provided"}
 - Company: {submission.company or "not provided"}
 - Source: {submission.source}
-
-Analysis
-- Detected language: {analysis.language}
+- Language: {analysis.language}
 - Category: {analysis.category}
 - Priority: {analysis.priority}
-- Summary: {analysis.summary}
-- Key points: {", ".join(analysis.key_points)}
-- Sentiment: {analysis.sentiment}
 - Lead score: {analysis.lead_score}
+- Sentiment: {analysis.sentiment}
 - Theme label: {analysis.theme_label}
 - Thread title: {analysis.thread_title}
-- Reply text: {analysis.reply_text}
 
-Thread
+AI summary
+- Summary: {analysis.summary}
+- Key points: {key_points_text}
+- Suggested reply: {analysis.reply_text}
+
+Thread context
 - Thread summary: {thread.get("summary", "")}
 - Thread priority: {thread.get("priority", "")}
 - Thread theme slug: {thread.get("theme_slug", "")}
@@ -724,11 +807,11 @@ Original message
 {submission.message}
 
 Dashboard
-{settings.app_base_url.rstrip("/")}/dashboard
+{dashboard_url}
 """
 
     email = EmailMessage()
-    email["Subject"] = f"[AI Portfolio Inbox] {analysis.priority.upper()} | {analysis.thread_title}"
+    email["Subject"] = f"[Portfolio Inbox] {analysis.priority.upper()} | {analysis.category.title()} | {submission.name}"
     email["From"] = settings.email_from
     email["To"] = settings.owner_email
     if submission.email:
@@ -736,14 +819,37 @@ Dashboard
     email.set_content(body.strip())
 
     try:
-        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=20) as smtp:
+        timeout_seconds = 20
+        use_ssl = not settings.smtp_use_tls and settings.smtp_port == 465
+        logger.info(
+            "SMTP connect start | message_id=%s | host=%s | port=%s | mode=%s | timeout=%ss",
+            message_id,
+            settings.smtp_host,
+            settings.smtp_port,
+            "smtp_ssl" if use_ssl else "smtp",
+            timeout_seconds,
+        )
+        smtp_client_factory = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
+        with smtp_client_factory(settings.smtp_host, settings.smtp_port, timeout=timeout_seconds) as smtp:
             if settings.smtp_use_tls:
-                smtp.starttls()
+                logger.info("SMTP EHLO before STARTTLS | message_id=%s", message_id)
+                smtp.ehlo()
+                logger.info("SMTP STARTTLS | message_id=%s", message_id)
+                smtp.starttls(context=ssl.create_default_context())
+                logger.info("SMTP EHLO after STARTTLS | message_id=%s", message_id)
+                smtp.ehlo()
+            elif not use_ssl:
+                logger.info("SMTP EHLO without TLS | message_id=%s", message_id)
+                smtp.ehlo()
+            logger.info("SMTP login start | message_id=%s | username_present=%s", message_id, bool(settings.smtp_username))
             smtp.login(settings.smtp_username, settings.smtp_password)
+            logger.info("SMTP send start | message_id=%s | to=%s | subject=%s", message_id, settings.owner_email, email["Subject"])
             smtp.send_message(email)
+            logger.info("SMTP send completed | message_id=%s", message_id)
+        logger.info("SMTP notification finished successfully | message_id=%s", message_id)
         return "sent"
-    except Exception as exc:
-        logger.exception("SMTP delivery failed for message %s: %s", message_id, exc)
+    except Exception:
+        logger.exception("SMTP delivery failed for message %s", message_id)
         return "failed"
 
 
@@ -768,7 +874,7 @@ def serialize_message(row: sqlite3.Row) -> dict[str, Any]:
         "raw_message": row["raw_message"] or "",
         "reply_text": row["reply_text"] or "",
         "thread_summary": row["thread_summary"] or "",
-        "email_status": row["email_status"] or "pending",
+        "email_status": allowed_email_status(row["email_status"] or "skipped"),
         "created_at": row["created_at"],
     }
 
@@ -1224,8 +1330,9 @@ async def create_message(payload: InboxSubmission) -> JSONResponse:
             message_id = int(cursor.lastrowid)
             thread = refresh_thread_rollup(connection, thread_id, analysis)
             related_messages = get_thread_messages(connection, thread_id, limit=4)
-            email_status = send_email_notification(message_id, payload, analysis, thread, related_messages)
+            email_status = allowed_email_status(send_email_notification(message_id, payload, analysis, thread, related_messages))
             connection.execute("UPDATE messages SET email_status = ? WHERE id = ?", (email_status, message_id))
+            logger.info("Inbox email status updated | message_id=%s | email_status=%s", message_id, email_status)
             connection.commit()
         except sqlite3.Error as exc:
             logger.exception("Failed to save inbox message: %s", exc)
@@ -1314,16 +1421,28 @@ async def dashboard_combined_insights() -> JSONResponse:
     return JSONResponse(build_combined_insights(metrics, analytics))
 
 
+@app.get("/api/debug/email")
+async def debug_email() -> JSONResponse:
+    return JSONResponse(smtp_diagnostics())
+
+
 @app.get("/health")
 async def healthcheck() -> JSONResponse:
+    smtp_info = smtp_diagnostics()
     return JSONResponse(
         {
             "status": "ok",
             "timestamp": utc_now(),
             "openai_configured": bool(settings.openai_api_key),
-            "smtp_configured": bool(settings.smtp_host and settings.smtp_username and settings.smtp_password),
+            "smtp_configured": smtp_info["smtp_ready"],
             "ga4_configured": ga4_configured(),
+            "smtp_host": smtp_info["smtp_host"],
+            "smtp_port": smtp_info["smtp_port"],
+            "smtp_use_tls": smtp_info["smtp_use_tls"],
+            "email_from": smtp_info["email_from"],
             "owner_email": settings.owner_email,
+            "smtp_username_configured": smtp_info["smtp_username_configured"],
+            "smtp_password_configured": smtp_info["smtp_password_configured"],
             "database_path": str(settings.database_path),
         }
     )

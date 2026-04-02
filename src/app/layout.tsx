@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { GoogleAnalytics } from "@next/third-parties/google";
+import ChatWidget from "@/components/chat/ChatWidget";
 import { Manrope, Space_Grotesk } from "next/font/google";
 import Footer from "@/components/layout/Footer";
 import Navbar from "@/components/layout/Navbar";
@@ -53,6 +54,7 @@ export default function RootLayout({
             <main className="flex-1">{children}</main>
             <Footer />
           </div>
+          <ChatWidget />
         </div>
         <GoogleAnalytics gaId="G-P4ST3Q00YH" />
       </body>

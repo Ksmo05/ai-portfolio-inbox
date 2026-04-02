@@ -4,6 +4,7 @@ import { notFound } from "next/navigation";
 import BlogCard from "@/components/cards/BlogCard";
 import ExperienceSnapshotCard from "@/components/cards/ExperienceSnapshotCard";
 import ProjectCard from "@/components/cards/ProjectCard";
+import AIInboxSection from "@/components/sections/AIInboxSection";
 import SectionHeader from "@/components/sections/SectionHeader";
 import { getAllPosts } from "@/lib/blog";
 import { getEducationEntries } from "@/lib/education";
@@ -195,6 +196,8 @@ export default async function LocalizedHomePage({ params }: PageProps) {
           </div>
         </div>
       </section>
+
+      <AIInboxSection locale={locale} />
 
       <section className="py-20">
         <SectionHeader eyebrow={locale === "es" ? "Experiencia" : "Experience"} title={text.experienceTitle} description={text.experienceDesc} />
