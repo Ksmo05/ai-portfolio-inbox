@@ -1,0 +1,1277 @@
+import json
+import logging
+import os
+import re
+import sqlite3
+import smtplib
+import unicodedata
+from contextlib import closing
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from pathlib import Path
+from typing import Any
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from openai import OpenAI
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
+
+try:
+    from google.analytics.data_v1beta import BetaAnalyticsDataClient
+    from google.analytics.data_v1beta.types import DateRange, Dimension, Metric, RunReportRequest
+
+    GA4_CLIENT_AVAILABLE = True
+except ImportError:
+    GA4_CLIENT_AVAILABLE = False
+
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("ai-portfolio-inbox")
+
+
+LANGUAGE_STOPWORDS = {
+    "es": {"hola", "gracias", "quiero", "necesito", "proyecto", "precio", "colaboracion", "colaboración", "para", "una", "con", "como", "puedes", "sugerencia", "error", "sitio", "mensaje"},
+    "en": {"hello", "thanks", "project", "pricing", "budget", "question", "suggestion", "issue", "website", "message", "need", "would", "like", "with", "about", "feature", "collaboration"},
+}
+
+PRIORITY_RANK = {"low": 1, "medium": 2, "high": 3}
+
+THEME_RULES = [
+    ("ai-automation", "AI automation and assistant builds", {"ai", "automation", "assistant", "agents", "chatbot", "llm", "openai", "copilot", "automatizacion"}),
+    ("project-collaboration", "Project collaboration opportunities", {"project", "projects", "hire", "freelance", "contract", "collaboration", "partnership", "consulting", "proyecto", "colaboracion", "colaboración"}),
+    ("pricing-budget", "Pricing and budget discussions", {"pricing", "budget", "quote", "cost", "proposal", "price", "precio", "presupuesto", "cotizacion", "cotización"}),
+    ("bug-performance", "Bugs and performance issues", {"bug", "broken", "error", "issue", "problem", "slow", "crash", "fix", "fallo", "problema", "lento"}),
+    ("analytics-dashboard", "Analytics and dashboard requests", {"analytics", "dashboard", "ga4", "google", "tracking", "reporting", "insights", "metricas", "métricas"}),
+    ("content-portfolio", "Portfolio content and case studies", {"portfolio", "case", "study", "content", "copy", "about", "resume", "cv", "portafolio", "contenido"}),
+    ("ux-feedback", "Portfolio UX and design feedback", {"feedback", "suggestion", "improve", "design", "ui", "ux", "layout", "experience", "sugerencia", "mejora"}),
+    ("api-integration", "API and integration topics", {"api", "integration", "webhook", "backend", "database", "sqlite", "fastapi", "smtp", "integracion", "integración"}),
+]
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def iso_days_ago(days: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+
+
+def slugify(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "general"
+
+
+def parse_json_list(raw: Any, fallback: list[str] | None = None) -> list[str]:
+    if isinstance(raw, list):
+        return [str(item) for item in raw]
+    if not raw:
+        return fallback or []
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return fallback or []
+    if isinstance(parsed, list):
+        return [str(item) for item in parsed]
+    return fallback or []
+
+
+def normalize_list(values: list[str], limit: int = 6) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = re.sub(r"\s+", " ", str(value)).strip()
+        if text and text.lower() not in seen:
+            seen.add(text.lower())
+            cleaned.append(text)
+    return cleaned[:limit]
+
+
+def tokenize(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-zA-Záéíóúñü0-9]{3,}", text.lower())
+        if token not in {"this", "that", "with", "from", "have", "your", "about", "would", "para", "como", "esto", "esta", "este"}
+    }
+
+
+def detect_language(text: str) -> str:
+    tokens = tokenize(text)
+    es_score = len(tokens & LANGUAGE_STOPWORDS["es"])
+    en_score = len(tokens & LANGUAGE_STOPWORDS["en"])
+    if re.search(r"[ñáéíóú]", text.lower()):
+        es_score += 2
+    return "es" if es_score > en_score else "en"
+
+
+@dataclass
+class Settings:
+    database_path: Path
+    openai_api_key: str
+    openai_model: str
+    smtp_host: str
+    smtp_port: int
+    smtp_username: str
+    smtp_password: str
+    smtp_use_tls: bool
+    email_from: str
+    owner_email: str
+    app_base_url: str
+    ai_match_threshold: float
+    ga4_property_id: str
+    google_application_credentials: str
+
+
+def load_settings() -> Settings:
+    owner_email = os.getenv("OWNER_EMAIL", "c.sanmiguelortega@gmail.com").strip()
+    return Settings(
+        database_path=BASE_DIR / os.getenv("DATABASE_PATH", "ai_portfolio_inbox.db"),
+        openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
+        openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip(),
+        smtp_host=os.getenv("SMTP_HOST", "").strip(),
+        smtp_port=int(os.getenv("SMTP_PORT", "587")),
+        smtp_username=os.getenv("SMTP_USERNAME", "").strip(),
+        smtp_password=os.getenv("SMTP_PASSWORD", "").strip(),
+        smtp_use_tls=os.getenv("SMTP_USE_TLS", "true").strip().lower() in {"1", "true", "yes", "on"},
+        email_from=os.getenv("EMAIL_FROM", "").strip(),
+        owner_email=os.getenv("OWNER_EMAIL", owner_email).strip() or owner_email,
+        app_base_url=os.getenv("APP_BASE_URL", "http://127.0.0.1:8000").strip(),
+        ai_match_threshold=float(os.getenv("AI_MATCH_THRESHOLD", "0.33")),
+        ga4_property_id=os.getenv("GA4_PROPERTY_ID", "").strip(),
+        google_application_credentials=os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip(),
+    )
+
+
+settings = load_settings()
+
+
+class InboxSubmission(BaseModel):
+    name: str = Field(min_length=2, max_length=80)
+    email: EmailStr | None = None
+    company: str | None = Field(default=None, max_length=120)
+    message: str = Field(min_length=12, max_length=3000)
+    source: str = Field(default="portfolio-widget", max_length=80)
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+
+class MessageAnalysis(BaseModel):
+    language: str = Field(pattern="^(es|en)$")
+    category: str
+    priority: str
+    summary: str
+    key_points: list[str]
+    theme_label: str
+    theme_slug: str
+    thread_title: str
+    reply_text: str
+    lead_score: int = Field(ge=1, le=5)
+    sentiment: str
+
+
+app = FastAPI(title="AI Portfolio Inbox & Insights", version="2.0.0")
+app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+
+def get_openai_client() -> OpenAI | None:
+    if not settings.openai_api_key:
+        return None
+    return OpenAI(api_key=settings.openai_api_key)
+
+
+def get_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(settings.database_path)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def existing_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
+    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {row["name"] for row in rows}
+
+
+def ensure_columns(connection: sqlite3.Connection, table_name: str, columns: dict[str, str]) -> None:
+    current = existing_columns(connection, table_name)
+    for column_name, definition in columns.items():
+        if column_name not in current:
+            connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+
+
+def init_db() -> None:
+    with closing(get_connection()) as connection:
+        connection.executescript(
+            """
+            PRAGMA journal_mode=WAL;
+
+            CREATE TABLE IF NOT EXISTS threads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                theme_slug TEXT,
+                theme_label TEXT,
+                thread_title TEXT,
+                priority TEXT,
+                summary TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                message_count INTEGER DEFAULT 0,
+                lead_score INTEGER DEFAULT 1,
+                slug TEXT,
+                title TEXT,
+                category TEXT,
+                theme_tags TEXT,
+                representative_summary TEXT,
+                urgency_score INTEGER DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id INTEGER NOT NULL,
+                user_name TEXT,
+                user_email TEXT,
+                company TEXT,
+                source TEXT,
+                language TEXT,
+                category TEXT,
+                priority TEXT,
+                lead_score INTEGER DEFAULT 1,
+                sentiment TEXT,
+                summary TEXT,
+                key_points_json TEXT DEFAULT '[]',
+                raw_message TEXT,
+                reply_text TEXT,
+                theme_label TEXT,
+                theme_slug TEXT,
+                thread_summary TEXT,
+                email_status TEXT,
+                analysis_engine TEXT,
+                created_at TEXT,
+                sender_name TEXT,
+                sender_email TEXT,
+                message_text TEXT,
+                message_summary TEXT,
+                suggested_reply TEXT,
+                urgency_score INTEGER DEFAULT 0,
+                themes TEXT DEFAULT '[]',
+                needs_follow_up INTEGER DEFAULT 0,
+                FOREIGN KEY(thread_id) REFERENCES threads(id)
+            );
+            """
+        )
+        ensure_columns(
+            connection,
+            "threads",
+            {
+                "theme_slug": "TEXT",
+                "theme_label": "TEXT",
+                "thread_title": "TEXT",
+                "priority": "TEXT",
+                "summary": "TEXT",
+                "created_at": "TEXT",
+                "updated_at": "TEXT",
+                "message_count": "INTEGER DEFAULT 0",
+                "lead_score": "INTEGER DEFAULT 1",
+            },
+        )
+        ensure_columns(
+            connection,
+            "messages",
+            {
+                "user_name": "TEXT",
+                "user_email": "TEXT",
+                "source": "TEXT",
+                "language": "TEXT",
+                "category": "TEXT",
+                "priority": "TEXT",
+                "lead_score": "INTEGER DEFAULT 1",
+                "sentiment": "TEXT",
+                "summary": "TEXT",
+                "key_points_json": "TEXT DEFAULT '[]'",
+                "raw_message": "TEXT",
+                "reply_text": "TEXT",
+                "theme_label": "TEXT",
+                "theme_slug": "TEXT",
+                "thread_summary": "TEXT",
+                "email_status": "TEXT",
+                "analysis_engine": "TEXT",
+                "created_at": "TEXT",
+            },
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages(thread_id)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_theme_slug ON messages(theme_slug)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_threads_theme_slug ON threads(theme_slug)")
+        connection.commit()
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    init_db()
+
+
+def fallback_theme(tokens: set[str]) -> tuple[str, str]:
+    for slug, label, keywords in THEME_RULES:
+        if tokens & keywords:
+            return slug, label
+    return "general-inquiries", "General inbound inquiries"
+
+
+def heuristic_analysis(submission: InboxSubmission) -> tuple[MessageAnalysis, str]:
+    message = submission.message.strip()
+    lower_text = f"{message} {submission.company or ''}".lower()
+    tokens = tokenize(lower_text)
+    language = detect_language(lower_text)
+
+    question_words = {"how", "what", "can", "could", "when", "where", "why", "como", "que", "qué", "puedes", "podrias", "podrías"}
+    suggestion_words = {"suggestion", "idea", "improve", "feature", "recommend", "sugerencia", "mejora", "recomiendo"}
+    project_words = {"project", "hire", "freelance", "contract", "pricing", "budget", "proposal", "collaboration", "proyecto", "contratar", "presupuesto", "propuesta", "colaboracion", "colaboración"}
+    bug_words = {"bug", "issue", "error", "broken", "problem", "fix", "fallo", "problema", "arreglar"}
+    positive_words = {"great", "love", "excellent", "awesome", "helpful", "genial", "encanta", "excelente", "buen"}
+    negative_words = {"broken", "issue", "problem", "confusing", "slow", "fallo", "problema", "confuso", "lento"}
+    urgent_words = {"urgent", "asap", "today", "deadline", "immediately", "urgente", "hoy", "inmediato", "inmediatamente"}
+
+    if tokens & bug_words:
+        category = "bug report"
+    elif tokens & project_words:
+        category = "project inquiry"
+    elif tokens & suggestion_words:
+        category = "suggestion"
+    elif "?" in message or tokens & question_words:
+        category = "question"
+    else:
+        category = "general feedback"
+
+    if tokens & negative_words:
+        sentiment = "negative"
+    elif tokens & positive_words:
+        sentiment = "positive"
+    else:
+        sentiment = "neutral"
+
+    lead_score = 2
+    if category == "project inquiry":
+        lead_score = 4
+    if submission.company:
+        lead_score += 1
+    if tokens & {"enterprise", "company", "team", "teams", "empresa", "equipo"}:
+        lead_score += 1
+    lead_score = max(1, min(5, lead_score))
+
+    priority = "low"
+    if category == "bug report" and tokens & urgent_words:
+        priority = "high"
+    elif category == "project inquiry" and (lead_score >= 4 or tokens & urgent_words):
+        priority = "high"
+    elif category in {"suggestion", "question", "bug report"} or lead_score >= 3:
+        priority = "medium"
+
+    theme_slug, theme_label = fallback_theme(tokens)
+    thread_title = f"{theme_label} thread"
+    sentence_parts = [part.strip() for part in re.split(r"(?<=[.!?])\s+", message) if part.strip()]
+    summary = (sentence_parts[0] if sentence_parts else message)[:220]
+    key_points = normalize_list(sentence_parts[:3] or [summary], limit=5)
+
+    if language == "es":
+        reply_text = "Gracias por escribir. He registrado tu mensaje y lo revisaré en breve con el contexto del hilo relacionado."
+    else:
+        reply_text = "Thanks for reaching out. I have logged your message and will review it shortly with the related thread context."
+
+    return (
+        MessageAnalysis(
+            language=language,
+            category=category,
+            priority=priority,
+            summary=summary,
+            key_points=key_points,
+            theme_label=theme_label,
+            theme_slug=theme_slug,
+            thread_title=thread_title,
+            reply_text=reply_text,
+            lead_score=lead_score,
+            sentiment=sentiment,
+        ),
+        "heuristic",
+    )
+
+
+def openai_analysis(submission: InboxSubmission) -> tuple[MessageAnalysis, str]:
+    client = get_openai_client()
+    if client is None:
+        return heuristic_analysis(submission)
+
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "language": {"type": "string", "enum": ["es", "en"]},
+            "category": {"type": "string", "enum": ["question", "suggestion", "project inquiry", "bug report", "general feedback"]},
+            "priority": {"type": "string", "enum": ["high", "medium", "low"]},
+            "summary": {"type": "string"},
+            "key_points": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 5},
+            "theme_label": {"type": "string"},
+            "theme_slug": {"type": "string"},
+            "thread_title": {"type": "string"},
+            "reply_text": {"type": "string"},
+            "lead_score": {"type": "integer", "minimum": 1, "maximum": 5},
+            "sentiment": {"type": "string", "enum": ["positive", "neutral", "negative"]},
+        },
+        "required": ["language", "category", "priority", "summary", "key_points", "theme_label", "theme_slug", "thread_title", "reply_text", "lead_score", "sentiment"],
+    }
+
+    prompt = f"""
+Analyze this inbound portfolio message for an AI product engineer.
+
+Rules:
+- Detect whether the message language is Spanish or English.
+- reply_text must be in the same language as the user.
+- summary and key_points should stay in the same language as the user.
+- theme_label and thread_title should be concise, professional English labels for dashboard consistency.
+- theme_slug must be stable, lowercase, hyphenated, and suitable for grouping similar topics.
+- Project, collaboration, commercial, or consulting opportunities should usually have a higher lead_score.
+- Urgent bugs or time-sensitive project opportunities should often be high priority.
+- Do not invent facts.
+- Keep summary concise and useful.
+
+Metadata:
+- sender_name: {submission.name}
+- sender_email: {submission.email or "not provided"}
+- company: {submission.company or "not provided"}
+- source: {submission.source}
+
+Message:
+{submission.message}
+"""
+
+    try:
+        response = client.responses.create(
+            model=settings.openai_model,
+            input=[
+                {"role": "system", "content": [{"type": "input_text", "text": "You classify inbound messages and return strict JSON matching the provided schema."}]},
+                {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+            ],
+            text={"format": {"type": "json_schema", "name": "bilingual_message_analysis", "strict": True, "schema": schema}},
+        )
+        parsed = MessageAnalysis.model_validate(json.loads(response.output_text))
+        parsed.key_points = normalize_list(parsed.key_points, limit=5)
+        parsed.theme_slug = slugify(parsed.theme_slug)
+        return parsed, "openai"
+    except Exception as exc:
+        logger.exception("OpenAI analysis failed, falling back to heuristics: %s", exc)
+        return heuristic_analysis(submission)
+
+
+def text_summary_from_messages(messages: list[dict[str, Any]]) -> str:
+    if not messages:
+        return "No thread activity yet."
+    top_points: list[str] = []
+    for message in messages[:5]:
+        top_points.extend(message.get("key_points", [])[:2])
+    top_points = normalize_list(top_points, limit=4)
+    if top_points:
+        return "This thread centers on: " + "; ".join(top_points) + "."
+    return "This thread contains recurring inbound discussion around a shared topic."
+
+
+def maybe_generate_ai_thread_summary(messages: list[dict[str, Any]], fallback_summary: str) -> str:
+    client = get_openai_client()
+    if client is None or not messages:
+        return fallback_summary
+    snippets = []
+    for message in messages[:6]:
+        snippets.append(
+            f"- language: {message['language']}\n- category: {message['category']}\n- summary: {message['summary']}\n- key points: {', '.join(message['key_points'])}"
+        )
+    try:
+        response = client.responses.create(
+            model=settings.openai_model,
+            input="Generate a short internal thread summary in English based on these recent messages:\n\n" + "\n\n".join(snippets),
+        )
+        summary = response.output_text.strip()
+        return summary or fallback_summary
+    except Exception as exc:
+        logger.info("Thread summary fallback used after OpenAI error: %s", exc)
+        return fallback_summary
+
+
+def get_thread_messages(connection: sqlite3.Connection, thread_id: int, limit: int = 6) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT
+            id,
+            COALESCE(user_name, sender_name) AS user_name,
+            COALESCE(user_email, sender_email) AS user_email,
+            company,
+            source,
+            language,
+            category,
+            priority,
+            lead_score,
+            sentiment,
+            COALESCE(summary, message_summary) AS summary,
+            key_points_json,
+            COALESCE(raw_message, message_text) AS raw_message,
+            reply_text,
+            theme_label,
+            theme_slug,
+            thread_summary,
+            email_status,
+            created_at
+        FROM messages
+        WHERE thread_id = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (thread_id, limit),
+    ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "user_name": row["user_name"],
+            "user_email": row["user_email"],
+            "company": row["company"],
+            "source": row["source"],
+            "language": row["language"] or "en",
+            "category": row["category"] or "general feedback",
+            "priority": row["priority"] or "low",
+            "lead_score": row["lead_score"] or 1,
+            "sentiment": row["sentiment"] or "neutral",
+            "summary": row["summary"] or "",
+            "key_points": parse_json_list(row["key_points_json"]),
+            "raw_message": row["raw_message"] or "",
+            "reply_text": row["reply_text"] or "",
+            "theme_label": row["theme_label"] or "",
+            "theme_slug": row["theme_slug"] or "",
+            "thread_summary": row["thread_summary"] or "",
+            "email_status": row["email_status"] or "pending",
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
+
+
+def get_or_create_thread(connection: sqlite3.Connection, analysis: MessageAnalysis) -> int:
+    existing = connection.execute(
+        "SELECT id FROM threads WHERE theme_slug = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
+        (analysis.theme_slug,),
+    ).fetchone()
+    if existing:
+        return int(existing["id"])
+
+    now = utc_now()
+    cursor = connection.execute(
+        """
+        INSERT INTO threads (
+            theme_slug, theme_label, thread_title, priority, summary, created_at, updated_at,
+            message_count, lead_score, slug, title, category, theme_tags, representative_summary, urgency_score
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 0)
+        """,
+        (
+            analysis.theme_slug,
+            analysis.theme_label,
+            analysis.thread_title,
+            analysis.priority,
+            analysis.summary,
+            now,
+            now,
+            analysis.lead_score,
+            analysis.theme_slug,
+            analysis.thread_title,
+            analysis.category,
+            json.dumps([analysis.theme_label]),
+            analysis.summary,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def refresh_thread_rollup(connection: sqlite3.Connection, thread_id: int, analysis: MessageAnalysis) -> dict[str, Any]:
+    messages = get_thread_messages(connection, thread_id, limit=6)
+    fallback_summary = text_summary_from_messages(messages)
+    thread_summary = maybe_generate_ai_thread_summary(messages, fallback_summary)
+    highest_priority = "low"
+    highest_lead = 1
+    for message in messages:
+        if PRIORITY_RANK.get(message["priority"], 1) > PRIORITY_RANK.get(highest_priority, 1):
+            highest_priority = message["priority"]
+        highest_lead = max(highest_lead, int(message["lead_score"]))
+    now = utc_now()
+    connection.execute(
+        """
+        UPDATE threads
+        SET
+            theme_slug = ?,
+            theme_label = ?,
+            thread_title = ?,
+            priority = ?,
+            summary = ?,
+            updated_at = ?,
+            message_count = (SELECT COUNT(*) FROM messages WHERE thread_id = ?),
+            lead_score = ?,
+            slug = ?,
+            title = ?,
+            representative_summary = ?,
+            theme_tags = ?
+        WHERE id = ?
+        """,
+        (
+            analysis.theme_slug,
+            analysis.theme_label,
+            analysis.thread_title,
+            highest_priority,
+            thread_summary,
+            now,
+            thread_id,
+            highest_lead,
+            analysis.theme_slug,
+            analysis.thread_title,
+            thread_summary,
+            json.dumps([analysis.theme_label]),
+            thread_id,
+        ),
+    )
+    connection.execute("UPDATE messages SET thread_summary = ? WHERE thread_id = ?", (thread_summary, thread_id))
+    row = connection.execute(
+        """
+        SELECT
+            id,
+            theme_slug,
+            theme_label,
+            COALESCE(thread_title, title) AS thread_title,
+            priority,
+            COALESCE(summary, representative_summary) AS summary,
+            created_at,
+            updated_at,
+            message_count,
+            lead_score
+        FROM threads
+        WHERE id = ?
+        """,
+        (thread_id,),
+    ).fetchone()
+    return dict(row) if row else {}
+
+
+def send_email_notification(message_id: int, submission: InboxSubmission, analysis: MessageAnalysis, thread: dict[str, Any], related_messages: list[dict[str, Any]]) -> str:
+    smtp_ready = all([settings.smtp_host, settings.smtp_username, settings.smtp_password, settings.email_from, settings.owner_email])
+    if not smtp_ready:
+        logger.info("SMTP is not configured. Message %s stored, email skipped.", message_id)
+        return "skipped"
+
+    related_lines = []
+    for related in related_messages[:3]:
+        if related["id"] == message_id:
+            continue
+        related_lines.append(f"- {related['created_at']} | {related['user_name']} | {related['priority']} | {related['summary']}")
+
+    body = f"""
+New AI Portfolio Inbox & Insights message
+
+Sender
+- Name: {submission.name}
+- Email: {submission.email or "not provided"}
+- Company: {submission.company or "not provided"}
+- Source: {submission.source}
+
+Analysis
+- Detected language: {analysis.language}
+- Category: {analysis.category}
+- Priority: {analysis.priority}
+- Summary: {analysis.summary}
+- Key points: {", ".join(analysis.key_points)}
+- Sentiment: {analysis.sentiment}
+- Lead score: {analysis.lead_score}
+- Theme label: {analysis.theme_label}
+- Thread title: {analysis.thread_title}
+- Reply text: {analysis.reply_text}
+
+Thread
+- Thread summary: {thread.get("summary", "")}
+- Thread priority: {thread.get("priority", "")}
+- Thread theme slug: {thread.get("theme_slug", "")}
+- Message count: {thread.get("message_count", 0)}
+
+Recent related messages
+{chr(10).join(related_lines) if related_lines else "- No previous related messages yet."}
+
+Original message
+{submission.message}
+
+Dashboard
+{settings.app_base_url.rstrip("/")}/dashboard
+"""
+
+    email = EmailMessage()
+    email["Subject"] = f"[AI Portfolio Inbox] {analysis.priority.upper()} | {analysis.thread_title}"
+    email["From"] = settings.email_from
+    email["To"] = settings.owner_email
+    if submission.email:
+        email["Reply-To"] = str(submission.email)
+    email.set_content(body.strip())
+
+    try:
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=20) as smtp:
+            if settings.smtp_use_tls:
+                smtp.starttls()
+            smtp.login(settings.smtp_username, settings.smtp_password)
+            smtp.send_message(email)
+        return "sent"
+    except Exception as exc:
+        logger.exception("SMTP delivery failed for message %s: %s", message_id, exc)
+        return "failed"
+
+
+def serialize_message(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "thread_id": row["thread_id"],
+        "thread_title": row["thread_title"],
+        "theme_slug": row["theme_slug"],
+        "theme_label": row["theme_label"],
+        "user_name": row["user_name"],
+        "user_email": row["user_email"],
+        "company": row["company"],
+        "source": row["source"],
+        "language": row["language"] or "en",
+        "category": row["category"] or "general feedback",
+        "priority": row["priority"] or "low",
+        "lead_score": row["lead_score"] or 1,
+        "sentiment": row["sentiment"] or "neutral",
+        "summary": row["summary"] or "",
+        "key_points": parse_json_list(row["key_points_json"]),
+        "raw_message": row["raw_message"] or "",
+        "reply_text": row["reply_text"] or "",
+        "thread_summary": row["thread_summary"] or "",
+        "email_status": row["email_status"] or "pending",
+        "created_at": row["created_at"],
+    }
+
+
+def recent_messages(limit: int = 12) -> list[dict[str, Any]]:
+    with closing(get_connection()) as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                m.id,
+                m.thread_id,
+                COALESCE(t.thread_title, t.title) AS thread_title,
+                COALESCE(t.theme_slug, m.theme_slug) AS theme_slug,
+                COALESCE(t.theme_label, m.theme_label) AS theme_label,
+                COALESCE(m.user_name, m.sender_name) AS user_name,
+                COALESCE(m.user_email, m.sender_email) AS user_email,
+                m.company,
+                m.source,
+                m.language,
+                COALESCE(m.category, t.category) AS category,
+                m.priority,
+                m.lead_score,
+                m.sentiment,
+                COALESCE(m.summary, m.message_summary) AS summary,
+                m.key_points_json,
+                COALESCE(m.raw_message, m.message_text) AS raw_message,
+                m.reply_text,
+                m.thread_summary,
+                m.email_status,
+                m.created_at
+            FROM messages m
+            JOIN threads t ON t.id = m.thread_id
+            ORDER BY m.created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [serialize_message(row) for row in rows]
+
+
+def thread_rows(limit: int = 20) -> list[dict[str, Any]]:
+    with closing(get_connection()) as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                id,
+                theme_slug,
+                theme_label,
+                COALESCE(thread_title, title) AS thread_title,
+                priority,
+                COALESCE(summary, representative_summary) AS summary,
+                created_at,
+                updated_at,
+                message_count,
+                lead_score
+            FROM threads
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def aggregate_counts(connection: sqlite3.Connection, column_name: str) -> dict[str, int]:
+    rows = connection.execute(
+        f"""
+        SELECT COALESCE({column_name}, 'unknown') AS label, COUNT(*) AS total
+        FROM messages
+        GROUP BY COALESCE({column_name}, 'unknown')
+        ORDER BY total DESC
+        """
+    ).fetchall()
+    return {row["label"]: row["total"] for row in rows}
+
+
+def dashboard_message_metrics(connection: sqlite3.Connection) -> dict[str, Any]:
+    total_messages = connection.execute("SELECT COUNT(*) AS total FROM messages").fetchone()["total"]
+    top_themes = [
+        dict(row)
+        for row in connection.execute(
+            """
+            SELECT COALESCE(theme_label, 'General inbound inquiries') AS label,
+                   COALESCE(theme_slug, 'general-inquiries') AS slug,
+                   COUNT(*) AS total
+            FROM messages
+            GROUP BY COALESCE(theme_slug, 'general-inquiries'), COALESCE(theme_label, 'General inbound inquiries')
+            ORDER BY total DESC
+            LIMIT 6
+            """
+        ).fetchall()
+    ]
+    message_volume = [
+        dict(row)
+        for row in connection.execute(
+            """
+            SELECT substr(created_at, 1, 10) AS day, COUNT(*) AS total
+            FROM messages
+            WHERE created_at >= ?
+            GROUP BY substr(created_at, 1, 10)
+            ORDER BY day ASC
+            """,
+            (iso_days_ago(30),),
+        ).fetchall()
+    ]
+    highest_leads = [
+        serialize_message(row)
+        for row in connection.execute(
+            """
+            SELECT
+                m.id,
+                m.thread_id,
+                COALESCE(t.thread_title, t.title) AS thread_title,
+                COALESCE(t.theme_slug, m.theme_slug) AS theme_slug,
+                COALESCE(t.theme_label, m.theme_label) AS theme_label,
+                COALESCE(m.user_name, m.sender_name) AS user_name,
+                COALESCE(m.user_email, m.sender_email) AS user_email,
+                m.company,
+                m.source,
+                m.language,
+                m.category,
+                m.priority,
+                m.lead_score,
+                m.sentiment,
+                COALESCE(m.summary, m.message_summary) AS summary,
+                m.key_points_json,
+                COALESCE(m.raw_message, m.message_text) AS raw_message,
+                m.reply_text,
+                m.thread_summary,
+                m.email_status,
+                m.created_at
+            FROM messages m
+            JOIN threads t ON t.id = m.thread_id
+            ORDER BY m.lead_score DESC, CASE m.priority WHEN 'high' THEN 3 WHEN 'medium' THEN 2 ELSE 1 END DESC, m.created_at DESC
+            LIMIT 5
+            """
+        ).fetchall()
+    ]
+    recent_high_priority = [
+        serialize_message(row)
+        for row in connection.execute(
+            """
+            SELECT
+                m.id,
+                m.thread_id,
+                COALESCE(t.thread_title, t.title) AS thread_title,
+                COALESCE(t.theme_slug, m.theme_slug) AS theme_slug,
+                COALESCE(t.theme_label, m.theme_label) AS theme_label,
+                COALESCE(m.user_name, m.sender_name) AS user_name,
+                COALESCE(m.user_email, m.sender_email) AS user_email,
+                m.company,
+                m.source,
+                m.language,
+                m.category,
+                m.priority,
+                m.lead_score,
+                m.sentiment,
+                COALESCE(m.summary, m.message_summary) AS summary,
+                m.key_points_json,
+                COALESCE(m.raw_message, m.message_text) AS raw_message,
+                m.reply_text,
+                m.thread_summary,
+                m.email_status,
+                m.created_at
+            FROM messages m
+            JOIN threads t ON t.id = m.thread_id
+            WHERE m.priority = 'high'
+            ORDER BY m.created_at DESC
+            LIMIT 6
+            """
+        ).fetchall()
+    ]
+    return {
+        "total_messages": total_messages,
+        "by_priority": aggregate_counts(connection, "priority"),
+        "by_category": aggregate_counts(connection, "category"),
+        "by_language": aggregate_counts(connection, "language"),
+        "by_sentiment": aggregate_counts(connection, "sentiment"),
+        "top_themes": top_themes,
+        "message_volume": message_volume,
+        "highest_leads": highest_leads,
+        "recent_high_priority": recent_high_priority,
+        "top_opportunities": [item for item in highest_leads if item["lead_score"] >= 4][:4],
+        "recurring_interests": top_themes[:4],
+    }
+
+
+def fallback_executive_summary(metrics: dict[str, Any]) -> str:
+    total = metrics["total_messages"]
+    top_theme = metrics["top_themes"][0]["label"] if metrics["top_themes"] else "general inbound inquiries"
+    top_opportunities = len(metrics["top_opportunities"])
+    return f"The inbox has captured {total} messages so far. The most requested topic is {top_theme}. There are {top_opportunities} strong opportunity signals based on lead score and priority."
+
+
+def generate_executive_summary(metrics: dict[str, Any]) -> str:
+    client = get_openai_client()
+    fallback = fallback_executive_summary(metrics)
+    if client is None:
+        return fallback
+    prompt = {
+        "total_messages": metrics["total_messages"],
+        "by_priority": metrics["by_priority"],
+        "by_category": metrics["by_category"],
+        "by_language": metrics["by_language"],
+        "top_themes": metrics["top_themes"],
+        "top_opportunities": [{"summary": item["summary"], "lead_score": item["lead_score"], "priority": item["priority"], "theme_label": item["theme_label"]} for item in metrics["top_opportunities"]],
+    }
+    try:
+        response = client.responses.create(
+            model=settings.openai_model,
+            input="Write a concise executive summary in English for a portfolio inbox dashboard based on this JSON:\n" + json.dumps(prompt, ensure_ascii=True),
+        )
+        return response.output_text.strip() or fallback
+    except Exception as exc:
+        logger.info("Executive summary fallback used after OpenAI error: %s", exc)
+        return fallback
+
+
+def ga4_configured() -> bool:
+    return bool(settings.ga4_property_id and settings.google_application_credentials and GA4_CLIENT_AVAILABLE)
+
+
+def fetch_ga4_analytics() -> dict[str, Any]:
+    if not settings.ga4_property_id:
+        return {"status": "not_configured", "reason": "GA4_PROPERTY_ID is not set."}
+    if not settings.google_application_credentials:
+        return {"status": "not_configured", "reason": "GOOGLE_APPLICATION_CREDENTIALS is not set."}
+    if not GA4_CLIENT_AVAILABLE:
+        return {"status": "not_configured", "reason": "google-analytics-data client library is not installed."}
+    try:
+        client = BetaAnalyticsDataClient()
+        property_name = f"properties/{settings.ga4_property_id}"
+        totals = client.run_report(
+            RunReportRequest(
+                property=property_name,
+                date_ranges=[DateRange(start_date="30daysAgo", end_date="today")],
+                metrics=[Metric(name="totalUsers"), Metric(name="sessions"), Metric(name="screenPageViews"), Metric(name="engagedSessions")],
+            )
+        )
+        totals_row = totals.rows[0].metric_values if totals.rows else []
+        top_pages_report = client.run_report(
+            RunReportRequest(
+                property=property_name,
+                date_ranges=[DateRange(start_date="30daysAgo", end_date="today")],
+                dimensions=[Dimension(name="pagePath")],
+                metrics=[Metric(name="screenPageViews")],
+                limit=5,
+            )
+        )
+        trend_report = client.run_report(
+            RunReportRequest(
+                property=property_name,
+                date_ranges=[DateRange(start_date="14daysAgo", end_date="today")],
+                dimensions=[Dimension(name="date")],
+                metrics=[Metric(name="totalUsers"), Metric(name="sessions")],
+            )
+        )
+        channels_report = client.run_report(
+            RunReportRequest(
+                property=property_name,
+                date_ranges=[DateRange(start_date="30daysAgo", end_date="today")],
+                dimensions=[Dimension(name="sessionDefaultChannelGroup")],
+                metrics=[Metric(name="sessions")],
+                limit=6,
+            )
+        )
+        return {
+            "status": "configured",
+            "totals": {
+                "users": int(totals_row[0].value) if len(totals_row) > 0 else 0,
+                "sessions": int(totals_row[1].value) if len(totals_row) > 1 else 0,
+                "page_views": int(totals_row[2].value) if len(totals_row) > 2 else 0,
+                "engaged_sessions": int(totals_row[3].value) if len(totals_row) > 3 else 0,
+            },
+            "top_pages": [{"page": row.dimension_values[0].value or "/", "page_views": int(row.metric_values[0].value)} for row in top_pages_report.rows],
+            "time_series": [{"day": row.dimension_values[0].value, "users": int(row.metric_values[0].value), "sessions": int(row.metric_values[1].value)} for row in trend_report.rows],
+            "traffic_sources": [{"channel": row.dimension_values[0].value or "Unknown", "sessions": int(row.metric_values[0].value)} for row in channels_report.rows],
+        }
+    except Exception as exc:
+        logger.exception("Failed to fetch GA4 analytics: %s", exc)
+        return {"status": "error", "reason": str(exc)}
+
+
+def keyword_overlap_score(label: str, pages: list[dict[str, Any]]) -> int:
+    label_tokens = set(slugify(label).split("-"))
+    score = 0
+    for page in pages:
+        page_tokens = set(slugify(page.get("page", "")).split("-"))
+        if label_tokens & page_tokens:
+            score += int(page.get("page_views", 0))
+    return score
+
+
+def build_combined_insights(metrics: dict[str, Any], analytics: dict[str, Any]) -> dict[str, Any]:
+    insights: list[str] = []
+    opportunities: list[str] = []
+    for item in metrics["top_opportunities"][:3]:
+        opportunities.append(f"{item['theme_label']} is showing opportunity potential with lead score {item['lead_score']} and {item['priority']} priority.")
+    if analytics.get("status") == "configured":
+        for theme in metrics["top_themes"][:3]:
+            overlap = keyword_overlap_score(theme["label"], analytics.get("top_pages", []))
+            if overlap > 0:
+                insights.append(f"{theme['label']} appears directionally aligned with traffic on related pages, based on keyword overlap with top visited content.")
+        message_days = {item["day"]: item["total"] for item in metrics["message_volume"]}
+        traffic_days = {item["day"]: item["sessions"] for item in analytics.get("time_series", [])}
+        shared_days = set(message_days) & set(traffic_days)
+        if shared_days:
+            peak_day = max(shared_days, key=lambda day: message_days[day] + traffic_days[day])
+            insights.append(f"Traffic and inbound activity both peaked around {peak_day}, which may indicate a content-driven contact moment.")
+    else:
+        insights.append("GA4 is not configured, so combined insights currently rely only on inbox activity.")
+    if metrics["top_themes"]:
+        insights.append(f"The most requested topic right now is {metrics['top_themes'][0]['label']}.")
+    return {
+        "summary": fallback_executive_summary(metrics) + " Combined insights are approximate and based on theme frequency plus available traffic patterns.",
+        "insights": insights[:5],
+        "top_opportunities": opportunities[:4],
+        "most_requested_topics": [item["label"] for item in metrics["top_themes"][:5]],
+        "analytics_status": analytics.get("status", "not_configured"),
+    }
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request) -> HTMLResponse:
+    return templates.TemplateResponse(
+        "index.html",
+        {
+            "request": request,
+            "sample_threads": recent_messages(6),
+            "has_openai": bool(settings.openai_api_key),
+            "has_smtp": bool(settings.smtp_host and settings.smtp_username and settings.smtp_password),
+            "ga4_enabled": ga4_configured(),
+        },
+    )
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(request: Request) -> HTMLResponse:
+    return templates.TemplateResponse(
+        "dashboard.html",
+        {
+            "request": request,
+            "has_openai": bool(settings.openai_api_key),
+            "has_smtp": bool(settings.smtp_host and settings.smtp_username and settings.smtp_password),
+            "ga4_enabled": ga4_configured(),
+        },
+    )
+
+
+@app.get("/api/messages")
+async def list_messages(limit: int = Query(default=12, ge=1, le=100)) -> JSONResponse:
+    return JSONResponse({"items": recent_messages(limit)})
+
+
+@app.get("/api/threads")
+async def list_threads(limit: int = Query(default=20, ge=1, le=100)) -> JSONResponse:
+    return JSONResponse({"items": thread_rows(limit)})
+
+
+@app.get("/api/threads/{thread_id}")
+async def get_thread(thread_id: int) -> JSONResponse:
+    with closing(get_connection()) as connection:
+        thread = connection.execute(
+            """
+            SELECT
+                id,
+                theme_slug,
+                theme_label,
+                COALESCE(thread_title, title) AS thread_title,
+                priority,
+                COALESCE(summary, representative_summary) AS summary,
+                created_at,
+                updated_at,
+                message_count,
+                lead_score
+            FROM threads
+            WHERE id = ?
+            """,
+            (thread_id,),
+        ).fetchone()
+        if thread is None:
+            raise HTTPException(status_code=404, detail="Thread not found.")
+        messages = get_thread_messages(connection, thread_id, limit=20)
+    return JSONResponse({"thread": dict(thread), "messages": messages})
+
+
+@app.post("/api/inbox")
+async def create_message(payload: InboxSubmission) -> JSONResponse:
+    analysis, engine = openai_analysis(payload)
+    now = utc_now()
+    with closing(get_connection()) as connection:
+        try:
+            thread_id = get_or_create_thread(connection, analysis)
+            cursor = connection.execute(
+                """
+                INSERT INTO messages (
+                    thread_id, user_name, user_email, company, source, language, category, priority, lead_score,
+                    sentiment, summary, key_points_json, raw_message, reply_text, theme_label, theme_slug,
+                    thread_summary, email_status, analysis_engine, created_at, sender_name, sender_email,
+                    message_text, message_summary, suggested_reply, urgency_score, themes, needs_follow_up
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    thread_id,
+                    payload.name,
+                    payload.email,
+                    payload.company,
+                    payload.source,
+                    analysis.language,
+                    analysis.category,
+                    analysis.priority,
+                    analysis.lead_score,
+                    analysis.sentiment,
+                    analysis.summary,
+                    json.dumps(analysis.key_points),
+                    payload.message,
+                    analysis.reply_text,
+                    analysis.theme_label,
+                    analysis.theme_slug,
+                    "",
+                    "pending",
+                    engine,
+                    now,
+                    payload.name,
+                    payload.email,
+                    payload.message,
+                    analysis.summary,
+                    analysis.reply_text,
+                    PRIORITY_RANK.get(analysis.priority, 1) * 25,
+                    json.dumps([analysis.theme_label]),
+                    1 if analysis.priority != "low" or analysis.lead_score >= 4 else 0,
+                ),
+            )
+            message_id = int(cursor.lastrowid)
+            thread = refresh_thread_rollup(connection, thread_id, analysis)
+            related_messages = get_thread_messages(connection, thread_id, limit=4)
+            email_status = send_email_notification(message_id, payload, analysis, thread, related_messages)
+            connection.execute("UPDATE messages SET email_status = ? WHERE id = ?", (email_status, message_id))
+            connection.commit()
+        except sqlite3.Error as exc:
+            logger.exception("Failed to save inbox message: %s", exc)
+            raise HTTPException(status_code=500, detail="Unable to save inbox message right now.") from exc
+
+        row = connection.execute(
+            """
+            SELECT
+                m.id,
+                m.thread_id,
+                COALESCE(t.thread_title, t.title) AS thread_title,
+                COALESCE(t.theme_slug, m.theme_slug) AS theme_slug,
+                COALESCE(t.theme_label, m.theme_label) AS theme_label,
+                COALESCE(m.user_name, m.sender_name) AS user_name,
+                COALESCE(m.user_email, m.sender_email) AS user_email,
+                m.company,
+                m.source,
+                m.language,
+                m.category,
+                m.priority,
+                m.lead_score,
+                m.sentiment,
+                COALESCE(m.summary, m.message_summary) AS summary,
+                m.key_points_json,
+                COALESCE(m.raw_message, m.message_text) AS raw_message,
+                m.reply_text,
+                m.thread_summary,
+                m.email_status,
+                m.created_at
+            FROM messages m
+            JOIN threads t ON t.id = m.thread_id
+            WHERE m.id = ?
+            """,
+            (message_id,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=500, detail="Message saved but could not be reloaded.")
+    return JSONResponse({"ok": True, "analysis_engine": engine, "message": serialize_message(row), "thread": thread, "related_messages": related_messages}, status_code=201)
+
+
+@app.get("/api/dashboard/summary")
+async def dashboard_summary() -> JSONResponse:
+    with closing(get_connection()) as connection:
+        metrics = dashboard_message_metrics(connection)
+    metrics["executive_summary"] = generate_executive_summary(metrics)
+    return JSONResponse(metrics)
+
+
+@app.get("/api/dashboard/messages")
+async def dashboard_messages() -> JSONResponse:
+    with closing(get_connection()) as connection:
+        metrics = dashboard_message_metrics(connection)
+    return JSONResponse(
+        {
+            "recent_high_priority": metrics["recent_high_priority"],
+            "highest_leads": metrics["highest_leads"],
+            "message_volume": metrics["message_volume"],
+            "top_opportunities": metrics["top_opportunities"],
+            "most_requested_topics": metrics["recurring_interests"],
+        }
+    )
+
+
+@app.get("/api/dashboard/analytics")
+async def dashboard_analytics() -> JSONResponse:
+    return JSONResponse(fetch_ga4_analytics())
+
+
+@app.get("/api/dashboard/combined-insights")
+async def dashboard_combined_insights() -> JSONResponse:
+    with closing(get_connection()) as connection:
+        metrics = dashboard_message_metrics(connection)
+    analytics = fetch_ga4_analytics()
+    return JSONResponse(build_combined_insights(metrics, analytics))
+
+
+@app.get("/health")
+async def healthcheck() -> JSONResponse:
+    return JSONResponse(
+        {
+            "status": "ok",
+            "timestamp": utc_now(),
+            "openai_configured": bool(settings.openai_api_key),
+            "smtp_configured": bool(settings.smtp_host and settings.smtp_username and settings.smtp_password),
+            "ga4_configured": ga4_configured(),
+            "owner_email": settings.owner_email,
+            "database_path": str(settings.database_path),
+        }
+    )

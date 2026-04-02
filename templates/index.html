@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Portfolio Inbox & Insights</title>
+    <meta
+      name="description"
+      content="A bilingual AI portfolio inbox with thematic grouping, executive summaries, and traffic-aware insights."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="{{ url_for('static', path='widget.css') }}" />
+  </head>
+  <body>
+    <main class="page-shell">
+      <section class="hero-panel hero-grid">
+        <div>
+          <div class="eyebrow">Portfolio-ready AI product demo</div>
+          <h1>AI Portfolio Inbox & Insights</h1>
+          <p class="hero-copy">
+            A bilingual contact widget that analyzes inbound messages, groups them into smart threads, stores them in
+            SQLite, emails structured summaries, and turns conversations into dashboard-ready product insights.
+          </p>
+          <div class="hero-actions">
+            <button class="primary-button" id="openWidgetInline" type="button">Open inbox widget</button>
+            <a class="ghost-button button-link" href="/dashboard">View dashboard</a>
+          </div>
+        </div>
+
+        <div class="status-grid compact-grid">
+          <article class="status-card">
+            <span class="status-label">AI analysis</span>
+            <strong>{{ "OpenAI configured" if has_openai else "Fallback mode active" }}</strong>
+            <p>Structured bilingual classification with safe heuristics when AI is unavailable.</p>
+          </article>
+          <article class="status-card">
+            <span class="status-label">Email owner inbox</span>
+            <strong>{{ "SMTP configured" if has_smtp else "Store-only fallback" }}</strong>
+            <p>Every inbound message is targeted to your owner inbox with thread context.</p>
+          </article>
+          <article class="status-card">
+            <span class="status-label">Traffic intelligence</span>
+            <strong>{{ "GA4 ready" if ga4_enabled else "GA4 optional" }}</strong>
+            <p>Combined traffic and inquiry insights appear automatically when analytics is configured.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="demo-grid">
+        <article class="surface-card">
+          <div class="section-head">
+            <div>
+              <span class="section-kicker">Live widget</span>
+              <h2>Bilingual contact inbox</h2>
+            </div>
+            <button class="ghost-button" id="toggleWidget" type="button">Open inbox</button>
+          </div>
+
+          <div class="widget-frame">
+            <div class="widget-launcher">
+              <div>
+                <span class="pulse-dot"></span>
+                <span>Visitors can write in English or Spanish</span>
+              </div>
+              <a class="ghost-button button-link" href="/dashboard">See insights</a>
+            </div>
+
+            <section class="inbox-widget" id="inboxWidget" aria-label="AI Portfolio Inbox widget" hidden>
+              <div class="widget-topbar">
+                <div>
+                  <span class="widget-kicker">AI triage inbox</span>
+                  <h3>Tell me what you need</h3>
+                </div>
+                <button class="close-button" id="closeWidget" type="button" aria-label="Close widget">x</button>
+              </div>
+
+              <form id="inboxForm" class="inbox-form" novalidate>
+                <label>
+                  <span>Name</span>
+                  <input type="text" name="name" maxlength="80" required />
+                </label>
+                <label>
+                  <span>Email</span>
+                  <input type="email" name="email" maxlength="120" placeholder="Optional, but recommended" />
+                </label>
+                <label>
+                  <span>Company</span>
+                  <input type="text" name="company" maxlength="120" placeholder="Optional" />
+                </label>
+                <label class="full-width">
+                  <span>Question, suggestion, or project inquiry</span>
+                  <textarea
+                    name="message"
+                    rows="5"
+                    maxlength="3000"
+                    required
+                    placeholder="Ask about a project, suggest an improvement, or report an issue. Spanish and English both work."
+                  ></textarea>
+                </label>
+                <button class="primary-button full-width" id="submitButton" type="submit">Send to AI inbox</button>
+              </form>
+
+              <div id="formFeedback" class="form-feedback" aria-live="polite"></div>
+
+              <section id="resultPanel" class="result-panel" hidden>
+                <div class="result-head">
+                  <span class="section-kicker">Latest analysis</span>
+                  <button class="ghost-button small-button" id="resetForm" type="button">Send another</button>
+                </div>
+                <div class="analysis-grid" id="analysisGrid"></div>
+                <div class="result-block">
+                  <h4>Acknowledgement reply</h4>
+                  <p id="replyText"></p>
+                </div>
+                <div class="result-block">
+                  <h4>Extracted key points</h4>
+                  <ul id="keyPointsList" class="bullet-list"></ul>
+                </div>
+                <div class="result-block">
+                  <h4>Thread summary</h4>
+                  <p id="threadSummary"></p>
+                </div>
+              </section>
+            </section>
+          </div>
+        </article>
+
+        <article class="surface-card">
+          <div class="section-head">
+            <div>
+              <span class="section-kicker">Recent activity</span>
+              <h2>Latest inbox threads</h2>
+            </div>
+            <button class="ghost-button" id="refreshFeed" type="button">Refresh</button>
+          </div>
+          <div id="threadFeed" class="thread-feed" data-initial-items='{{ sample_threads | tojson | safe }}'></div>
+        </article>
+      </section>
+    </main>
+
+    <script src="{{ url_for('static', path='widget.js') }}" defer></script>
+  </body>
+</html>

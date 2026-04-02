@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Portfolio Inbox & Insights Dashboard</title>
+    <meta
+      name="description"
+      content="A polished analytics dashboard for inbound portfolio messages and optional GA4 traffic insights."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="{{ url_for('static', path='widget.css') }}" />
+  </head>
+  <body>
+    <main class="page-shell dashboard-shell">
+      <section class="hero-panel dashboard-hero">
+        <div>
+          <div class="eyebrow">AI Portfolio Inbox & Insights</div>
+          <h1>Executive Dashboard</h1>
+          <p class="hero-copy">
+            Monitor message quality, themes, languages, opportunities, and optional GA4 traffic signals in one
+            polished portfolio demo surface.
+          </p>
+        </div>
+        <div class="hero-actions">
+          <a class="ghost-button button-link" href="/">Back to widget</a>
+        </div>
+      </section>
+
+      <section class="dashboard-grid">
+        <article class="surface-card span-12">
+          <div class="section-head">
+            <div>
+              <span class="section-kicker">Executive summary</span>
+              <h2>Inbox snapshot</h2>
+            </div>
+            <span class="status-chip">{{ "OpenAI on" if has_openai else "Fallback summaries" }}</span>
+          </div>
+          <p id="executiveSummary" class="executive-copy">Loading summary...</p>
+        </article>
+
+        <article class="surface-card metric-card">
+          <span class="section-kicker">Messages</span>
+          <h3 id="metricTotalMessages">0</h3>
+          <p>Total inbound messages captured</p>
+        </article>
+        <article class="surface-card metric-card">
+          <span class="section-kicker">Top priority</span>
+          <h3 id="metricTopPriority">-</h3>
+          <p>Most common current inbox urgency</p>
+        </article>
+        <article class="surface-card metric-card">
+          <span class="section-kicker">Top theme</span>
+          <h3 id="metricTopTheme">-</h3>
+          <p>Most requested topic right now</p>
+        </article>
+        <article class="surface-card metric-card">
+          <span class="section-kicker">GA4</span>
+          <h3 id="metricGaStatus">{{ "Live" if ga4_enabled else "Optional" }}</h3>
+          <p>Traffic analytics connection status</p>
+        </article>
+
+        <article class="surface-card span-6">
+          <div class="section-head">
+            <div>
+              <span class="section-kicker">Breakdowns</span>
+              <h2>Priority and sentiment</h2>
+            </div>
+          </div>
+          <div id="priorityChart" class="chart-stack"></div>
+          <div id="sentimentChart" class="chart-stack"></div>
+        </article>
+
+        <article class="surface-card span-6">
+          <div class="section-head">
+            <div>
+              <span class="section-kicker">Audience mix</span>
+              <h2>Language and category</h2>
+            </div>
+          </div>
+          <div id="languageChart" class="chart-stack"></div>
+          <div id="categoryChart" class="chart-stack"></div>
+        </article>
+
+        <article class="surface-card span-6">
+          <div class="section-head">
+            <div>
+              <span class="section-kicker">Demand patterns</span>
+              <h2>Top themes and recurring interests</h2>
+            </div>
+          </div>
+          <div id="topThemesList" class="list-stack"></div>
+          <div id="requestedTopicsList" class="list-stack compact-top"></div>
+        </article>
+
+        <article class="surface-card span-6">
+          <div class="section-head">
+            <div>
+              <span class="section-kicker">Opportunity radar</span>
+              <h2>Highest lead-score messages</h2>
+            </div>
+          </div>
+          <div id="topOpportunitiesList" class="list-stack"></div>
+        </article>
+
+        <article class="surface-card span-7">
+          <div class="section-head">
+            <div>
+              <span class="section-kicker">Recent urgency</span>
+              <h2>High-priority inbox activity</h2>
+            </div>
+          </div>
+          <div id="recentHighPriorityList" class="list-stack"></div>
+        </article>
+
+        <article class="surface-card span-5">
+          <div class="section-head">
+            <div>
+              <span class="section-kicker">Volume</span>
+              <h2>Message trend</h2>
+            </div>
+          </div>
+          <div id="messageVolumeChart" class="sparkline-bars"></div>
+        </article>
+
+        <article class="surface-card span-6">
+          <div class="section-head">
+            <div>
+              <span class="section-kicker">Traffic analytics</span>
+              <h2>GA4 signals</h2>
+            </div>
+            <span class="status-chip" id="analyticsStatusChip">Loading</span>
+          </div>
+          <div id="analyticsSummary" class="analytics-summary"></div>
+          <div id="topPagesList" class="list-stack compact-top"></div>
+          <div id="trafficSourcesList" class="list-stack compact-top"></div>
+        </article>
+
+        <article class="surface-card span-6">
+          <div class="section-head">
+            <div>
+              <span class="section-kicker">Combined insights</span>
+              <h2>Traffic plus inquiry patterns</h2>
+            </div>
+          </div>
+          <p id="combinedSummary" class="executive-copy">Loading combined insights...</p>
+          <div id="combinedInsightsList" class="list-stack compact-top"></div>
+        </article>
+      </section>
+    </main>
+
+    <script src="{{ url_for('static', path='dashboard.js') }}" defer></script>
+  </body>
+</html>
