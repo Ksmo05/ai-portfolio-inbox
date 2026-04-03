@@ -1347,7 +1347,13 @@ async def create_message(payload: InboxSubmission) -> JSONResponse:
             message_id = int(cursor.lastrowid)
             thread = refresh_thread_rollup(connection, thread_id, analysis)
             related_messages = get_thread_messages(connection, thread_id, limit=4)
-            email_status = allowed_email_status(send_email_notification(message_id, payload, analysis, thread, related_messages))
+            email_status = "skipped"
+            try:
+                email_status = allowed_email_status(
+                    send_email_notification(message_id, payload, analysis, thread, related_messages)
+                )
+            except Exception as e:
+                logger.exception("Email failed but continuing flow")
             connection.execute("UPDATE messages SET email_status = ? WHERE id = ?", (email_status, message_id))
             logger.info("Inbox email status updated | message_id=%s | email_status=%s", message_id, email_status)
             connection.commit()
