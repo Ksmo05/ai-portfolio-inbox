@@ -1,4 +1,4 @@
-const AI_INBOX_API_URL = "https://ai-portfolio-inbox.onrender.com/api/inbox";
+const AI_INBOX_API_URL = process.env.NEXT_PUBLIC_INBOX_API_URL;
 
 export const CHAT_WIDGET_SOURCE = "portfolio-chat-widget";
 export const CONTACT_FORM_SOURCE = "portfolio-vercel";
@@ -23,8 +23,22 @@ export type ContactFormPayload = {
   source: string;
 };
 
+function getInboxApiUrl() {
+  if (!AI_INBOX_API_URL) {
+    console.error("[aiInbox] Missing NEXT_PUBLIC_INBOX_API_URL");
+    return null;
+  }
+
+  return AI_INBOX_API_URL;
+}
+
 export async function postInboxPayload<TResponse>(payload: unknown) {
-  const response = await fetch(AI_INBOX_API_URL, {
+  const apiUrl = getInboxApiUrl();
+  if (!apiUrl) {
+    throw new Error("missing-inbox-api-url");
+  }
+
+  const response = await fetch(apiUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

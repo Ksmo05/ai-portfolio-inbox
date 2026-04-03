@@ -1,74 +1,82 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { usePathname } from "next/navigation";
-import ChatLauncher from "@/components/chat/ChatLauncher";
-import ChatWindow from "@/components/chat/ChatWindow";
-import type { ChatMessageRecord, QuickAction } from "@/components/chat/types";
 import { sendChatMessage } from "@/lib/aiInbox";
 import { getLocaleFromPathname, type Locale } from "@/lib/i18n";
 
+type ChatRole = "assistant" | "user";
+
+type ChatMessage = {
+  id: string;
+  role: ChatRole;
+  content: string;
+};
+
+type QuickAction = {
+  id: string;
+  label: string;
+  prompt: string;
+};
+
 type ChatCopy = {
-  assistantName: string;
+  title: string;
+  status: string;
+  welcome: string;
+  helper: string;
+  placeholder: string;
+  openLabel: string;
   closeLabel: string;
-  emptyStateLabel: string;
-  inputPlaceholder: string;
-  introLabel: string;
-  launcherLabel: string;
   resetLabel: string;
-  statusLabel: string;
-  typingLabel: string;
-  welcomeMessage: string;
-  errorMessage: string;
+  sendingLabel: string;
+  fallbackError: string;
   quickActions: QuickAction[];
 };
 
+const STORAGE_PREFIX = "portfolio-chat-widget";
+
 const copy: Record<Locale, ChatCopy> = {
   en: {
-    assistantName: "Carlos AI Assistant",
+    title: "Carlos AI Assistant",
+    status: "Usually replies instantly",
+    welcome:
+      "Hi, I can help you explore projects, understand Carlos' profile, review services and open a contact conversation.",
+    helper: "Start with a suggested question or write your own message.",
+    placeholder: "Write your message...",
+    openLabel: "Open chat",
     closeLabel: "Close chat",
-    emptyStateLabel:
-      "I can help you explore featured projects, understand Carlos' profile, review services and open a contact conversation for new opportunities.",
-    inputPlaceholder: "Write your message...",
-    introLabel: "Welcome",
-    launcherLabel: "Open Carlos AI Assistant",
     resetLabel: "Restart conversation",
-    statusLabel: "Usually replies instantly",
-    typingLabel: "Assistant is typing",
-    welcomeMessage:
-      "Hi, I'm here to guide you through Carlos' projects, experience, services and the best way to get in touch if you have an opportunity in mind.",
-    errorMessage:
-      "No he podido conectar con el asistente ahora mismo. Si quieres, puedes intentarlo de nuevo en unos segundos o usar la página de contacto.",
+    sendingLabel: "Carlos AI Assistant is typing...",
+    fallbackError:
+      "I can't connect to the assistant right now. Please try again in a moment or use the contact page.",
     quickActions: [
       { id: "projects", label: "View projects", prompt: "Show me Carlos' most relevant projects and explain why they stand out." },
       { id: "about", label: "About", prompt: "Tell me about Carlos' professional profile, experience and strongest differentiators." },
       {
         id: "services",
         label: "Services",
-        prompt: "What services does Carlos offer around AI, web content, digital workflows or automation?",
+        prompt: "What services does Carlos offer around AI, web content or automation?",
       },
       {
         id: "contact",
         label: "Contact",
-        prompt: "I would like to contact Carlos to discuss an opportunity or project. What is the best next step?",
+        prompt: "I would like to contact Carlos to discuss an opportunity or project.",
       },
     ],
   },
   es: {
-    assistantName: "Carlos AI Assistant",
+    title: "Carlos AI Assistant",
+    status: "Normalmente responde al instante",
+    welcome:
+      "Hola, puedo ayudarte a descubrir proyectos, entender mejor el perfil de Carlos, revisar servicios y abrir una conversación de contacto.",
+    helper: "Empieza con una sugerencia o escribe tu propio mensaje.",
+    placeholder: "Escribe tu mensaje...",
+    openLabel: "Abrir chat",
     closeLabel: "Cerrar chat",
-    emptyStateLabel:
-      "Puedo ayudarte a descubrir proyectos destacados, entender mejor el perfil de Carlos, revisar servicios y abrir una conversación de contacto para nuevas oportunidades.",
-    inputPlaceholder: "Escribe tu mensaje...",
-    introLabel: "Bienvenida",
-    launcherLabel: "Abrir Carlos AI Assistant",
     resetLabel: "Reiniciar conversación",
-    statusLabel: "Normalmente responde al instante",
-    typingLabel: "El asistente está escribiendo",
-    welcomeMessage:
-      "Hola, puedo orientarte sobre proyectos, experiencia, servicios y la mejor forma de contactar con Carlos si tienes una oportunidad o una idea en mente.",
-    errorMessage:
-      "No he podido conectar con el asistente ahora mismo. Si quieres, puedes intentarlo de nuevo en unos segundos o usar la página de contacto.",
+    sendingLabel: "Carlos AI Assistant está escribiendo...",
+    fallbackError:
+      "No puedo conectar con el asistente ahora mismo. Inténtalo de nuevo en unos segundos o usa la página de contacto.",
     quickActions: [
       { id: "projects", label: "Ver proyectos", prompt: "Muéstrame tus proyectos más destacados." },
       { id: "about", label: "Sobre mí", prompt: "Cuéntame tu perfil profesional y experiencia." },
@@ -86,9 +94,7 @@ const copy: Record<Locale, ChatCopy> = {
   },
 };
 
-const STORAGE_PREFIX = "portfolio-chat-widget";
-
-function createMessage(role: ChatMessageRecord["role"], content: string, id?: string): ChatMessageRecord {
+function makeMessage(role: ChatRole, content: string, id?: string): ChatMessage {
   return {
     id: id ?? `${role}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     role,
@@ -97,7 +103,7 @@ function createMessage(role: ChatMessageRecord["role"], content: string, id?: st
 }
 
 function getInitialMessages(locale: Locale) {
-  return [createMessage("assistant", copy[locale].welcomeMessage, `assistant-welcome-${locale}`)];
+  return [makeMessage("assistant", copy[locale].welcome, `assistant-welcome-${locale}`)];
 }
 
 export default function ChatWidget() {
@@ -105,30 +111,28 @@ export default function ChatWidget() {
   const locale = getLocaleFromPathname(pathname);
   const text = copy[locale];
   const storageKey = `${STORAGE_PREFIX}:${locale}`;
-  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const [isOpen, setIsOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [inputValue, setInputValue] = useState("");
-  const [messages, setMessages] = useState<ChatMessageRecord[]>(() => getInitialMessages(locale));
+  const [messages, setMessages] = useState<ChatMessage[]>(() => getInitialMessages(locale));
 
-  const showQuickActions = useMemo(() => messages.length <= 1 && !messages.some((message) => message.role === "user"), [messages]);
+  const showQuickActions = messages.length <= 1 && messages.every((message) => message.role !== "user");
 
   useEffect(() => {
     try {
       const saved = window.localStorage.getItem(storageKey);
-      if (!saved) {
-        setMessages(getInitialMessages(locale));
-        return;
-      }
-
-      const parsed = JSON.parse(saved) as ChatMessageRecord[];
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        setMessages(parsed);
-        return;
+      if (saved) {
+        const parsed = JSON.parse(saved) as ChatMessage[];
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setMessages(parsed);
+          return;
+        }
       }
     } catch {
-      // Ignore malformed localStorage and restore the default state.
+      // Ignore invalid persisted state and restore a clean conversation.
     }
 
     setMessages(getInitialMessages(locale));
@@ -139,32 +143,32 @@ export default function ChatWidget() {
   }, [messages, storageKey]);
 
   useEffect(() => {
-    const container = scrollContainerRef.current;
-    if (!container) return;
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [messages, isLoading, isOpen]);
 
-    container.scrollTo({
-      top: container.scrollHeight,
-      behavior: "smooth",
-    });
-  }, [isLoading, messages, isOpen]);
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = "0px";
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 120)}px`;
+  }, [inputValue]);
 
-  async function submitMessage(content: string) {
-    const trimmed = content.trim();
+  async function handleSend(message: string) {
+    const trimmed = message.trim();
     if (!trimmed || isLoading) return;
 
-    const userMessage = createMessage("user", trimmed);
-    setMessages((current) => [...current, userMessage]);
+    setMessages((current) => [...current, makeMessage("user", trimmed)]);
     setInputValue("");
     setIsLoading(true);
+    setIsOpen(true);
 
     try {
       const reply = await sendChatMessage(trimmed);
-      setMessages((current) => [...current, createMessage("assistant", reply)]);
+      setMessages((current) => [...current, makeMessage("assistant", reply)]);
     } catch {
-      setMessages((current) => [...current, createMessage("assistant", text.errorMessage)]);
+      setMessages((current) => [...current, makeMessage("assistant", text.fallbackError)]);
     } finally {
       setIsLoading(false);
-      setIsOpen(true);
     }
   }
 
@@ -176,34 +180,142 @@ export default function ChatWidget() {
   }
 
   return (
-    <div className="fixed bottom-4 right-4 z-50 sm:bottom-6 sm:right-6">
-      <ChatWindow
-        assistantName={text.assistantName}
-        closeLabel={text.closeLabel}
-        emptyStateLabel={text.emptyStateLabel}
-        inputPlaceholder={text.inputPlaceholder}
-        introLabel={text.introLabel}
-        isLoading={isLoading}
-        isOpen={isOpen}
-        messages={messages}
-        onChangeInput={setInputValue}
-        onClose={() => setIsOpen(false)}
-        onReset={handleReset}
-        onSelectQuickAction={(action) => {
-          setIsOpen(true);
-          void submitMessage(action.prompt);
-        }}
-        onSubmit={() => void submitMessage(inputValue)}
-        quickActions={text.quickActions}
-        resetLabel={text.resetLabel}
-        scrollContainerRef={scrollContainerRef}
-        showQuickActions={showQuickActions}
-        statusLabel={text.statusLabel}
-        typingLabel={text.typingLabel}
-        value={inputValue}
-      />
+    <div className="fixed bottom-4 right-4 z-[9999] sm:bottom-6 sm:right-6">
+      {isOpen ? (
+        <section className="mb-3 flex h-[min(70vh,34rem)] w-[min(calc(100vw-2rem),24rem)] flex-col overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-2xl">
+          <header className="flex items-start justify-between gap-3 border-b border-slate-200 px-4 py-4">
+            <div className="min-w-0">
+              <p className="truncate text-sm font-semibold text-slate-900">{text.title}</p>
+              <p className="mt-1 text-xs text-slate-500">{text.status}</p>
+            </div>
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={handleReset}
+                aria-label={text.resetLabel}
+                className="rounded-full p-2 text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
+              >
+                <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none">
+                  <path
+                    d="M4 4v5h5M20 20v-5h-5M19 9a7 7 0 0 0-12-2M5 15a7 7 0 0 0 12 2"
+                    stroke="currentColor"
+                    strokeWidth="1.7"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              </button>
+              <button
+                type="button"
+                onClick={() => setIsOpen(false)}
+                aria-label={text.closeLabel}
+                className="rounded-full p-2 text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
+              >
+                <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none">
+                  <path d="M7 7l10 10M17 7L7 17" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+                </svg>
+              </button>
+            </div>
+          </header>
 
-      <ChatLauncher isOpen={isOpen} onClick={() => setIsOpen((current) => !current)} label={text.launcherLabel} />
+          <div className="flex-1 overflow-y-auto bg-slate-50 px-4 py-4">
+            <div className="space-y-3">
+              {showQuickActions ? (
+                <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                  <p className="text-sm font-medium text-slate-900">{text.welcome}</p>
+                  <p className="mt-2 text-sm leading-6 text-slate-600">{text.helper}</p>
+                  <div className="mt-4 flex flex-wrap gap-2">
+                    {text.quickActions.map((action) => (
+                      <button
+                        key={action.id}
+                        type="button"
+                        disabled={isLoading}
+                        onClick={() => void handleSend(action.prompt)}
+                        className="rounded-full border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {action.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              {messages.map((message) => (
+                <div key={message.id} className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}>
+                  <div
+                    className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm leading-6 ${
+                      message.role === "user" ? "bg-slate-900 text-white" : "border border-slate-200 bg-white text-slate-700"
+                    }`}
+                  >
+                    {message.content}
+                  </div>
+                </div>
+              ))}
+
+              {isLoading ? (
+                <div className="flex justify-start">
+                  <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-500">{text.sendingLabel}</div>
+                </div>
+              ) : null}
+
+              <div ref={messagesEndRef} />
+            </div>
+          </div>
+
+          <div className="border-t border-slate-200 bg-white p-3">
+            <div className="flex items-end gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-3">
+              <textarea
+                ref={textareaRef}
+                rows={1}
+                value={inputValue}
+                disabled={isLoading}
+                placeholder={text.placeholder}
+                onChange={(event) => setInputValue(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    void handleSend(inputValue);
+                  }
+                }}
+                className="max-h-[120px] min-h-[24px] flex-1 resize-none bg-transparent text-sm text-slate-900 outline-none placeholder:text-slate-400 disabled:cursor-not-allowed"
+              />
+              <button
+                type="button"
+                disabled={isLoading || !inputValue.trim()}
+                onClick={() => void handleSend(inputValue)}
+                className="rounded-2xl bg-slate-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300"
+              >
+                {locale === "es" ? "Enviar" : "Send"}
+              </button>
+            </div>
+          </div>
+        </section>
+      ) : null}
+
+      <button
+        type="button"
+        onClick={() => setIsOpen((current) => !current)}
+        aria-expanded={isOpen}
+        aria-label={text.openLabel}
+        className="ml-auto flex h-14 w-14 items-center justify-center rounded-full bg-slate-900 text-white shadow-2xl transition hover:bg-slate-800"
+      >
+        {isOpen ? (
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none">
+            <path d="M7 7l10 10M17 7L7 17" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+          </svg>
+        ) : (
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none">
+            <path
+              d="M7 16.5L4 19V6.75C4 5.784 4.784 5 5.75 5h12.5C19.216 5 20 5.784 20 6.75v8.5c0 .966-.784 1.75-1.75 1.75H7Z"
+              stroke="currentColor"
+              strokeWidth="1.7"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+            <path d="M8 10h8M8 13h5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+          </svg>
+        )}
+      </button>
     </div>
   );
 }

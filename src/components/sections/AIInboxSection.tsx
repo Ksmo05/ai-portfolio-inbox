@@ -184,7 +184,11 @@ export default function AIInboxSection({ locale }: AIInboxSectionProps) {
       const message =
         submissionError instanceof TypeError ||
         (submissionError instanceof Error &&
-          (submissionError.message === "Failed to fetch" || submissionError.message === "invalid-json-response"))
+          (
+            submissionError.message === "Failed to fetch" ||
+            submissionError.message === "invalid-json-response" ||
+            submissionError.message === "missing-inbox-api-url"
+          ))
           ? text.networkError
           : submissionError instanceof Error
             ? submissionError.message

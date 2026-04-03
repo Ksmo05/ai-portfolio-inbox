@@ -54,8 +54,8 @@ export default function RootLayout({
             <main className="flex-1">{children}</main>
             <Footer />
           </div>
-          <ChatWidget />
         </div>
+        <ChatWidget />
         <GoogleAnalytics gaId="G-P4ST3Q00YH" />
       </body>
     </html>
