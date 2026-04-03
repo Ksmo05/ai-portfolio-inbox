@@ -1280,6 +1280,9 @@ async def get_thread(thread_id: int) -> JSONResponse:
 
 @app.post("/api/inbox")
 async def create_message(payload: InboxSubmission) -> JSONResponse:
+    # 🔥 FIX: soportar payload tipo chat (messages[])
+    if hasattr(payload, "messages") and payload.messages:
+        payload.message = payload.messages[-1].get("content", "")    
     logger.info(
         "Inbox submission received | source=%s | name=%s | email_provided=%s | company_provided=%s | message_length=%s",
         payload.source,
