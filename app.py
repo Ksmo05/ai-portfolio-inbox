@@ -218,6 +218,23 @@ class MessageAnalysis(BaseModel):
 
 
 app = FastAPI(title="AI Portfolio Inbox & Insights", version="2.0.0")
+# --- CORS CONFIG FROM ENV ---
+allowed_origins_raw = os.getenv("ALLOWED_ORIGINS", "")
+
+cors_allow_origins = [
+    origin.strip()
+    for origin in allowed_origins_raw.split(",")
+    if origin.strip()
+]
+
+# fallback para desarrollo
+if not cors_allow_origins:
+    cors_allow_origins = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+
+cors_allow_credentials = True
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_allow_origins,
