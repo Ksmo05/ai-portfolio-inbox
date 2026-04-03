@@ -66,6 +66,8 @@ export async function postInboxPayload<TResponse>(payload: unknown) {
 
 export async function sendChatMessage(message: string) {
   const { response, data } = await postInboxPayload<ChatReplyResponse>({
+    name: "Website Visitor",
+    company: null,
     message,
     source: CHAT_WIDGET_SOURCE,
   });
